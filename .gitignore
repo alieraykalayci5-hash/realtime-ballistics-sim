@@ -79,3 +79,6 @@ traj.csv
 flat.csv
 impacts.csv
 fc_report.csv
+
+# Ignore any local trajectory outputs
+traj_*.csv
