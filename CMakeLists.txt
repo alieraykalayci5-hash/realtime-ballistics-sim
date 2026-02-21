@@ -8,6 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(ballistics
     src/main.cpp
     src/sim/ballistics.cpp
+    src/sim/geometry.cpp
+    src/sim/collision.cpp
+    src/sim/fire_control.cpp
 )
 
 target_include_directories(ballistics PRIVATE src)

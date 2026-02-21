@@ -10,8 +10,12 @@
 
 #include "sim/ballistics.h"
 #include "sim/target.h"
+#include "sim/fire_control.h"
 
 struct Args {
+    std::string mode = "sim";         // sim | fc
+    std::string scenario = "demo";    // demo | hit | none (sim mode)
+
     double dt = 1.0 / 60.0;
     double sim_time_s = 8.0;
     int drag_on = 1;
@@ -20,31 +24,39 @@ struct Args {
     double elev_deg = 8.0;
     double y0 = 1.5;
 
-    std::string scenario = "demo"; // demo | hit | none
+    // Fire-control target (fc mode)
+    double tx = 60.0;
+    double ty = 1.0;
+    double tvx = -5.0;
+    double tvy = 0.0;
+
+    double hit_radius = 0.5;
+
     bool print_hash = false;
 };
 
 static void usage() {
     std::cout <<
         "Usage:\n"
-        "  ballistics [--scenario demo|hit|none]\n"
-        "             [--dt <seconds>] [--t <seconds>] [--drag 0|1]\n"
-        "             [--v0 <mps>] [--elev <deg>] [--y0 <m>] [--hash]\n"
+        "  ballistics --mode sim [--scenario demo|hit|none] [sim params...] [--hash] > traj.csv\n"
+        "  ballistics --mode fc  [fc params...]                              [--hash]\n"
         "\n"
-        "Scenarios:\n"
-        "  demo : medium-range targets (sphere at ~40m, AABB at ~70m), drag default ON\n"
-        "  hit  : hit-guaranteed test scenario (sphere at ~20m), drag default OFF\n"
-        "  none : no targets (trajectory only)\n"
+        "SIM params:\n"
+        "  --dt <sec> --t <sec> --drag 0|1 --v0 <m/s> --elev <deg> --y0 <m>\n"
+        "  --scenario demo|hit|none\n"
+        "\n"
+        "FC params (moving target in x-y plane):\n"
+        "  --dt <sec> --t <sec> --drag 0|1 --v0 <m/s> --y0 <m>\n"
+        "  --tx <m> --ty <m> --tvx <m/s> --tvy <m/s> --hit_radius <m>\n"
         "\n"
         "Outputs:\n"
-        "  - Trajectory CSV to stdout\n"
-        "  - impacts.csv written in working directory (only header if no impacts)\n"
-        "  - Optional determinism hash printed to stderr when --hash is used\n"
+        "  SIM: trajectory CSV to stdout + impacts.csv file\n"
+        "  FC : prints a single CSV line summary to stdout\n"
         "\n"
         "Examples:\n"
-        "  ballistics --scenario demo --dt 0.0166667 --t 8 --drag 1 --v0 260 --elev 8 --y0 1.5 --hash > traj.csv\n"
-        "  ballistics --scenario hit  --t 3 --hash > traj.csv\n"
-        "  ballistics --scenario none --t 8 --hash > traj.csv\n";
+        "  ballistics --mode sim --scenario hit --hash > traj_hit.csv\n"
+        "  ballistics --mode sim --scenario none --t 8 --hash > traj.csv\n"
+        "  ballistics --mode fc --t 6 --drag 0 --v0 220 --y0 1.5 --tx 80 --ty 1 --tvx -6 --tvy 0 --hit_radius 0.5\n";
 }
 
 static bool parse_double(int& i, int argc, char** argv, double& out) {
@@ -77,6 +89,10 @@ static bool parse_args(int argc, char** argv, Args& a) {
         if (s == "--help" || s == "-h") {
             usage();
             return false;
+        } else if (s == "--mode") {
+            if (i + 1 >= argc) return false;
+            a.mode = argv[i + 1];
+            i++;
         } else if (s == "--scenario") {
             if (i + 1 >= argc) return false;
             a.scenario = argv[i + 1];
@@ -93,6 +109,16 @@ static bool parse_args(int argc, char** argv, Args& a) {
             if (!parse_double(i, argc, argv, a.elev_deg)) return false;
         } else if (s == "--y0") {
             if (!parse_double(i, argc, argv, a.y0)) return false;
+        } else if (s == "--tx") {
+            if (!parse_double(i, argc, argv, a.tx)) return false;
+        } else if (s == "--ty") {
+            if (!parse_double(i, argc, argv, a.ty)) return false;
+        } else if (s == "--tvx") {
+            if (!parse_double(i, argc, argv, a.tvx)) return false;
+        } else if (s == "--tvy") {
+            if (!parse_double(i, argc, argv, a.tvy)) return false;
+        } else if (s == "--hit_radius") {
+            if (!parse_double(i, argc, argv, a.hit_radius)) return false;
         } else if (s == "--hash") {
             a.print_hash = true;
         } else {
@@ -103,43 +129,7 @@ static bool parse_args(int argc, char** argv, Args& a) {
     return true;
 }
 
-struct ScenarioConfig {
-    // When scenario sets “recommended defaults”, we apply them only if user didn’t override.
-    // To keep it simple, we apply scenario defaults always unless user explicitly provides flags.
-    // For now: scenario can override dt/t/drag/v0/elev/y0 if desired.
-    // (We keep it minimal: only drag defaults differ between demo and hit.)
-};
-
-static std::vector<sim::Target> make_targets_for_scenario(const std::string& name) {
-    using namespace sim;
-
-    static const Material steel{"steel", 1800.0};
-    static const Material wood {"wood",   250.0};
-
-    if (name == "none") {
-        return {};
-    }
-
-    if (name == "hit") {
-        // Hit-guaranteed: sphere aligned with launch height, closer range.
-        return {
-            Target::make_sphere({20.0, 1.0, 0.0}, 0.6, wood),
-            Target::make_aabb  ({40.0, 0.0, -0.5}, {42.0, 2.0, 0.5}, steel)
-        };
-    }
-
-    // default: "demo"
-    return {
-        Target::make_sphere({40.0, 1.0, 0.0}, 0.5, wood),
-        Target::make_aabb  ({70.0, 0.0, -0.5}, {72.0, 2.0, 0.5}, steel)
-    };
-}
-
 static void apply_scenario_defaults(const std::string& scenario, Args& a) {
-    // Keep defaults “engineering sensible”:
-    // - demo: drag ON, v0/elev/y0 typical
-    // - hit : drag OFF, straight shot, short sim
-    // - none: doesn’t matter, keep user’s inputs
     if (scenario == "hit") {
         a.drag_on = 0;
         a.sim_time_s = 3.0;
@@ -148,43 +138,36 @@ static void apply_scenario_defaults(const std::string& scenario, Args& a) {
         a.y0 = 1.0;
         a.dt = 1.0 / 60.0;
     } else if (scenario == "demo") {
-        // keep existing defaults as-is
+        // keep defaults
     } else if (scenario == "none") {
-        // keep as-is
+        // keep defaults
     }
 }
 
-int main(int argc, char** argv) {
+static std::vector<sim::Target> make_targets_for_scenario(const std::string& name) {
     using namespace sim;
 
-    Args args;
+    static const Material steel{"steel", 1800.0};
+    static const Material wood {"wood",   250.0};
 
-    // First pass parse to detect scenario early? We’ll do:
-    // - If user passed --scenario, we want scenario defaults first,
-    //   then parse again to allow user overrides.
-    // Implementation: scan scenario manually, apply defaults, then full parse.
+    if (name == "none") return {};
 
-    std::string scenario_from_cli = "demo";
-    for (int i = 1; i < argc; ++i) {
-        std::string s = argv[i];
-        if (s == "--scenario" && i + 1 < argc) {
-            scenario_from_cli = argv[i + 1];
-            break;
-        }
-    }
-    args.scenario = scenario_from_cli;
-    apply_scenario_defaults(args.scenario, args);
-
-    if (!parse_args(argc, argv, args)) {
-        usage();
-        return 2;
+    if (name == "hit") {
+        return {
+            Target::make_sphere({20.0, 1.0, 0.0}, 0.6, wood),
+            Target::make_aabb  ({40.0, 0.0, -0.5}, {42.0, 2.0, 0.5}, steel)
+        };
     }
 
-    if (args.scenario != "demo" && args.scenario != "hit" && args.scenario != "none") {
-        std::cerr << "Invalid --scenario: " << args.scenario << "\n";
-        usage();
-        return 2;
-    }
+    // demo
+    return {
+        Target::make_sphere({40.0, 1.0, 0.0}, 0.5, wood),
+        Target::make_aabb  ({70.0, 0.0, -0.5}, {72.0, 2.0, 0.5}, steel)
+    };
+}
+
+static int run_sim(const Args& args) {
+    using namespace sim;
 
     SimConfig cfg;
     cfg.dt = args.dt;
@@ -225,10 +208,8 @@ int main(int argc, char** argv) {
         h = fnv1a64_update(h, s.data(), s.size());
     };
 
-    // Trajectory CSV (stdout)
     emit("t,x,y,z,vx,vy,vz,speed,alive\n");
 
-    // Impact report (file)
     std::ofstream impacts("impacts.csv", std::ios::binary);
     impacts << "t,material,target,ke_j,threshold_j,result,x,y,z\n";
     impacts << std::fixed << std::setprecision(6);
@@ -276,4 +257,89 @@ int main(int argc, char** argv) {
     }
 
     return 0;
+}
+
+static int run_fc(const Args& args) {
+    using namespace sim;
+
+    SimConfig cfg;
+    cfg.dt = args.dt;
+    cfg.gravity = {0.0, -9.80665, 0.0};
+    cfg.air_density = 1.225;
+    cfg.enable_drag = (args.drag_on != 0);
+    cfg.ground_collision = true;
+
+    if (cfg.dt <= 0.0 || args.sim_time_s <= 0.0) {
+        std::cerr << "Invalid dt or t\n";
+        return 2;
+    }
+
+    Target2D tgt;
+    tgt.pos_m = {args.tx, args.ty, 0.0};
+    tgt.vel_mps = {args.tvx, args.tvy, 0.0};
+
+    FireControlConfig fc;
+    fc.hit_radius_m = args.hit_radius;
+
+    FireControlResult r = solve_lead_2d(cfg, args.sim_time_s, args.v0, args.y0, tgt, fc);
+
+    // Print single-line CSV summary (machine friendly)
+    // header + line
+    std::cout << "success,lead_elev_deg,t_hit_s,miss_m,eval_count,proj_x,proj_y,tgt_x,tgt_y\n";
+    std::cout << std::fixed << std::setprecision(6)
+              << (r.success ? 1 : 0) << ","
+              << r.lead_elev_deg << ","
+              << r.t_hit_s << ","
+              << r.miss_m << ","
+              << r.eval_count << ","
+              << r.proj_at_hit_m.x << ","
+              << r.proj_at_hit_m.y << ","
+              << r.tgt_at_hit_m.x << ","
+              << r.tgt_at_hit_m.y << "\n";
+
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    Args args;
+
+    // Scenario defaults should apply only in sim mode and only after we know scenario.
+    // We'll sniff scenario first for sim mode.
+    std::string scenario_from_cli = "demo";
+    std::string mode_from_cli = "sim";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string s = argv[i];
+        if (s == "--mode" && i + 1 < argc) mode_from_cli = argv[i + 1];
+        if (s == "--scenario" && i + 1 < argc) scenario_from_cli = argv[i + 1];
+    }
+
+    args.mode = mode_from_cli;
+    args.scenario = scenario_from_cli;
+
+    if (args.mode == "sim") {
+        apply_scenario_defaults(args.scenario, args);
+    }
+
+    if (!parse_args(argc, argv, args)) {
+        usage();
+        return 2;
+    }
+
+    if (args.mode != "sim" && args.mode != "fc") {
+        std::cerr << "Invalid --mode: " << args.mode << "\n";
+        usage();
+        return 2;
+    }
+
+    if (args.mode == "sim") {
+        if (args.scenario != "demo" && args.scenario != "hit" && args.scenario != "none") {
+            std::cerr << "Invalid --scenario: " << args.scenario << "\n";
+            usage();
+            return 2;
+        }
+        return run_sim(args);
+    }
+
+    return run_fc(args);
 }
