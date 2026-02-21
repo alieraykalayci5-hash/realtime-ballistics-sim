@@ -24,13 +24,16 @@ struct Args {
     double elev_deg = 8.0;
     double y0 = 1.5;
 
-    // Fire-control target (fc mode)
+    // Fire-control target (fc mode) - x/y plane, z=0
     double tx = 60.0;
     double ty = 1.0;
     double tvx = -5.0;
     double tvy = 0.0;
 
     double hit_radius = 0.5;
+
+    // Fire-control report output file
+    std::string fc_out = "fc_report.csv";
 
     bool print_hash = false;
 };
@@ -39,7 +42,7 @@ static void usage() {
     std::cout <<
         "Usage:\n"
         "  ballistics --mode sim [--scenario demo|hit|none] [sim params...] [--hash] > traj.csv\n"
-        "  ballistics --mode fc  [fc params...]                              [--hash]\n"
+        "  ballistics --mode fc  [fc params...] [--fc_out <file>] [--hash]\n"
         "\n"
         "SIM params:\n"
         "  --dt <sec> --t <sec> --drag 0|1 --v0 <m/s> --elev <deg> --y0 <m>\n"
@@ -48,15 +51,15 @@ static void usage() {
         "FC params (moving target in x-y plane):\n"
         "  --dt <sec> --t <sec> --drag 0|1 --v0 <m/s> --y0 <m>\n"
         "  --tx <m> --ty <m> --tvx <m/s> --tvy <m/s> --hit_radius <m>\n"
+        "  --fc_out <file>   (default: fc_report.csv)\n"
         "\n"
         "Outputs:\n"
         "  SIM: trajectory CSV to stdout + impacts.csv file\n"
-        "  FC : prints a single CSV line summary to stdout\n"
+        "  FC : summary CSV line to stdout + fc_report.csv file\n"
         "\n"
         "Examples:\n"
         "  ballistics --mode sim --scenario hit --hash > traj_hit.csv\n"
-        "  ballistics --mode sim --scenario none --t 8 --hash > traj.csv\n"
-        "  ballistics --mode fc --t 6 --drag 0 --v0 220 --y0 1.5 --tx 80 --ty 1 --tvx -6 --tvy 0 --hit_radius 0.5\n";
+        "  ballistics --mode fc --t 6 --drag 0 --v0 220 --y0 1.5 --tx 80 --ty 1 --tvx -6 --tvy 0 --hit_radius 0.5 --hash\n";
 }
 
 static bool parse_double(int& i, int argc, char** argv, double& out) {
@@ -119,6 +122,10 @@ static bool parse_args(int argc, char** argv, Args& a) {
             if (!parse_double(i, argc, argv, a.tvy)) return false;
         } else if (s == "--hit_radius") {
             if (!parse_double(i, argc, argv, a.hit_radius)) return false;
+        } else if (s == "--fc_out") {
+            if (i + 1 >= argc) return false;
+            a.fc_out = argv[i + 1];
+            i++;
         } else if (s == "--hash") {
             a.print_hash = true;
         } else {
@@ -283,19 +290,69 @@ static int run_fc(const Args& args) {
 
     FireControlResult r = solve_lead_2d(cfg, args.sim_time_s, args.v0, args.y0, tgt, fc);
 
-    // Print single-line CSV summary (machine friendly)
-    // header + line
-    std::cout << "success,lead_elev_deg,t_hit_s,miss_m,eval_count,proj_x,proj_y,tgt_x,tgt_y\n";
-    std::cout << std::fixed << std::setprecision(6)
-              << (r.success ? 1 : 0) << ","
-              << r.lead_elev_deg << ","
-              << r.t_hit_s << ","
-              << r.miss_m << ","
-              << r.eval_count << ","
-              << r.proj_at_hit_m.x << ","
-              << r.proj_at_hit_m.y << ","
-              << r.tgt_at_hit_m.x << ","
-              << r.tgt_at_hit_m.y << "\n";
+    // Build deterministic stdout summary (CSV)
+    std::ostringstream summary;
+    summary.setf(std::ios::fixed);
+    summary << std::setprecision(6);
+    summary << "success,lead_elev_deg,t_hit_s,miss_m,eval_count,proj_x,proj_y,tgt_x,tgt_y\n";
+    summary << (r.success ? 1 : 0) << ","
+            << r.lead_elev_deg << ","
+            << r.t_hit_s << ","
+            << r.miss_m << ","
+            << r.eval_count << ","
+            << r.proj_at_hit_m.x << ","
+            << r.proj_at_hit_m.y << ","
+            << r.tgt_at_hit_m.x << ","
+            << r.tgt_at_hit_m.y << "\n";
+
+    const std::string s_summary = summary.str();
+    std::cout << s_summary;
+
+    // Write detailed FC report file (single-run artifact)
+    std::ostringstream report;
+    report.setf(std::ios::fixed);
+    report << std::setprecision(6);
+
+    report << "dt,sim_time_s,drag_on,v0,y0,tx,ty,tvx,tvy,hit_radius,success,lead_elev_deg,t_hit_s,miss_m,eval_count,proj_x,proj_y,tgt_x,tgt_y\n";
+    report << cfg.dt << ","
+           << args.sim_time_s << ","
+           << (args.drag_on != 0 ? 1 : 0) << ","
+           << args.v0 << ","
+           << args.y0 << ","
+           << args.tx << ","
+           << args.ty << ","
+           << args.tvx << ","
+           << args.tvy << ","
+           << args.hit_radius << ","
+           << (r.success ? 1 : 0) << ","
+           << r.lead_elev_deg << ","
+           << r.t_hit_s << ","
+           << r.miss_m << ","
+           << r.eval_count << ","
+           << r.proj_at_hit_m.x << ","
+           << r.proj_at_hit_m.y << ","
+           << r.tgt_at_hit_m.x << ","
+           << r.tgt_at_hit_m.y << "\n";
+
+    const std::string s_report = report.str();
+
+    {
+        std::ofstream f(args.fc_out, std::ios::binary);
+        if (!f) {
+            std::cerr << "Failed to write " << args.fc_out << "\n";
+            return 2;
+        }
+        f << s_report;
+    }
+
+    // Hash determinism for FC mode:
+    // hash over both summary(stdout text) + report(file text)
+    if (args.print_hash) {
+        uint64_t h = 1469598103934665603ULL;
+        h = fnv1a64_update(h, s_summary.data(), s_summary.size());
+        h = fnv1a64_update(h, s_report.data(), s_report.size());
+        std::cerr << "FNV1A64=" << std::hex << h << std::dec << "\n";
+    }
 
     return 0;
 }
@@ -303,8 +360,7 @@ static int run_fc(const Args& args) {
 int main(int argc, char** argv) {
     Args args;
 
-    // Scenario defaults should apply only in sim mode and only after we know scenario.
-    // We'll sniff scenario first for sim mode.
+    // sniff mode/scenario for defaults
     std::string scenario_from_cli = "demo";
     std::string mode_from_cli = "sim";
 

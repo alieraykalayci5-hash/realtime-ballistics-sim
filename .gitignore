@@ -69,7 +69,13 @@ build.ninja
 *.dwo
 
 # =========================
-# Generated data
+# Generated data (local outputs)
 # =========================
 out.csv
 out2.csv
+out_stage2.csv
+out_targets.csv
+traj.csv
+flat.csv
+impacts.csv
+fc_report.csv
